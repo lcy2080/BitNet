@@ -691,6 +691,11 @@ if __name__ == "__main__":
                                                [640, 2560],
                                                [640, 6912],
                                                [160, 2560]],
+        # Padded version for llama.cpp compatibility (n_embd_head_k = 128)
+        "bitnet_b1_58-2B-4T-padded"         : [[6912, 2560],  # gate, up padded from 1728
+                                               [2560, 6912],  # down padded from 640
+                                               [2560, 2560],  # Q, O padded from 640
+                                               [640, 2560]],  # K, V padded from 160
         "Llama3-8B-1.58-100B-tokens"        : [[14336, 4096],
                                                [4096, 14336],
                                                [1024, 4096],
