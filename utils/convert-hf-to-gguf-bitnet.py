@@ -23,7 +23,8 @@ if TYPE_CHECKING:
     from torch import Tensor
 
 if 'NO_LOCAL_GGUF' not in os.environ:
-    sys.path.insert(1, str(Path(__file__).parent / 'gguf-py'))
+    # Use local gguf from llama.cpp submodule
+    sys.path.insert(1, str(Path(__file__).parent.parent / '3rdparty' / 'llama.cpp' / 'gguf-py'))
 import gguf
 
 from convert import LlamaHfVocab, permute
@@ -954,7 +955,7 @@ class LlamaModel(Model):
 
 @Model.register("BitnetForCausalLM", "BitNetForCausalLM")
 class BitnetModel(Model):
-    model_arch = gguf.MODEL_ARCH.BITNET
+    model_arch = gguf.MODEL_ARCH.BITNET_B158
 
     def set_vocab(self):
         # BitNet b1.58-2B-4T uses GPT-2 tokenizer
@@ -968,15 +969,9 @@ class BitnetModel(Model):
         self.gguf_writer.add_rope_scaling_type(gguf.RopeScalingType.LINEAR)
         self.gguf_writer.add_rope_scaling_factor(1.0)
 
-        # BitNet b1.58-2B-4T uses special attention dimensions
-        # K,V head dim is 32 (not 128 = hidden_size / n_heads)
-        # Q head dim is 128 but matches KV head count (5 heads)
-        n_head_kv = self.hparams.get("num_key_value_heads", 5)
-        # K,V dims: [n_head_kv * kv_head_dim, hidden_size] = [160, 2560] -> kv_head_dim = 32
-        # Q dims: [n_head_kv * q_head_dim, hidden_size] = [640, 2560] -> q_head_dim = 128
-        kv_head_dim = 32  # K,V head dimension
-        self.gguf_writer.add_key_length(kv_head_dim)
-        self.gguf_writer.add_value_length(kv_head_dim)
+        # Note: Do NOT set key_length/value_length - use default n_embd/n_head = 128
+        # Microsoft's GGUF pads actual [640, 2560] Q tensor to [2560, 2560]
+        # and [160, 2560] K/V tensors to [640, 2560]
 
     def weight_quant(self, weight):
         dtype = weight.dtype
@@ -986,11 +981,58 @@ class BitnetModel(Model):
         return result.type(dtype)
 
     def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
+        import torch.nn.functional as F
+
         # quant weight to i2 (in fp16)
-        if name.endswith(("q_proj.weight", "k_proj.weight", "v_proj.weight", 
+        if name.endswith(("q_proj.weight", "k_proj.weight", "v_proj.weight",
                           "down_proj.weight", "up_proj.weight", "gate_proj.weight",
                           "o_proj.weight")):
             data_torch = self.weight_quant(data_torch)
+
+        # Pad attention tensors to match llama.cpp expected dimensions
+        # Default n_embd_head_k = n_embd / n_head = 2560 / 20 = 128
+        # But actual tensors use head_dim = 32
+        # So we need to pad:
+        #   Q: [640, 2560] -> [2560, 2560]
+        #   K: [160, 2560] -> [640, 2560]
+        #   V: [160, 2560] -> [640, 2560]
+        #   O: [640, 2560] -> [2560, 2560]
+        n_embd = self.hparams["hidden_size"]  # 2560
+        n_head = self.hparams["num_attention_heads"]  # 20
+        n_head_kv = self.hparams.get("num_key_value_heads", n_head)  # 5
+        default_head_dim = n_embd // n_head  # 128
+        expected_q_dim = n_head * default_head_dim  # 2560
+        expected_kv_dim = n_head_kv * default_head_dim  # 640
+
+        if name.endswith("q_proj.weight") or name.endswith("o_proj.weight"):
+            # [640, 2560] -> [2560, 2560]
+            actual_dim = data_torch.shape[0]
+            if actual_dim < expected_q_dim:
+                pad_size = expected_q_dim - actual_dim
+                data_torch = F.pad(data_torch, (0, 0, 0, pad_size), mode='constant', value=0)
+        elif name.endswith(("k_proj.weight", "v_proj.weight")):
+            # [160, 2560] -> [640, 2560]
+            actual_dim = data_torch.shape[0]
+            if actual_dim < expected_kv_dim:
+                pad_size = expected_kv_dim - actual_dim
+                data_torch = F.pad(data_torch, (0, 0, 0, pad_size), mode='constant', value=0)
+
+        # Pad FFN tensors to match expected n_ff
+        # llama.cpp expects gate/up = [n_ff, n_embd], down = [n_embd, n_ff]
+        # But actual: gate/up = [1728, 2560], down = [640, 6912]
+        n_ff = self.hparams.get("intermediate_size", 6912)  # 6912
+        if name.endswith(("gate_proj.weight", "up_proj.weight")):
+            # [1728, 2560] -> [6912, 2560]
+            actual_dim = data_torch.shape[0]
+            if actual_dim < n_ff:
+                pad_size = n_ff - actual_dim
+                data_torch = F.pad(data_torch, (0, 0, 0, pad_size), mode='constant', value=0)
+        elif name.endswith("down_proj.weight"):
+            # [640, 6912] -> [2560, 6912]
+            actual_dim = data_torch.shape[0]
+            if actual_dim < n_embd:
+                pad_size = n_embd - actual_dim
+                data_torch = F.pad(data_torch, (0, 0, 0, pad_size), mode='constant', value=0)
 
         return [(self.map_tensor_name(name), data_torch)]
 
