@@ -50,13 +50,16 @@ AnyModel = TypeVar("AnyModel", bound="type[Model]")
 class Model(ABC):
     _model_classes: dict[str, type[Model]] = {}
 
-    def __init__(self, dir_model: Path, ftype: int, fname_out: Path, is_big_endian: bool, use_temp_file: bool):
+    def __init__(self, dir_model: Path, ftype: int, fname_out: Path, is_big_endian: bool, use_temp_file: bool,
+                 longrope_scale: float = 1.0, longrope_factors: Path | None = None):
         self.dir_model = dir_model
         self.ftype = ftype
         self.fname_out = fname_out
         self.is_big_endian = is_big_endian
         self.endianess = gguf.GGUFEndian.BIG if is_big_endian else gguf.GGUFEndian.LITTLE
         self.use_temp_file = use_temp_file
+        self.longrope_scale = longrope_scale
+        self.longrope_factors = longrope_factors
         self.is_safetensors = self._is_model_safetensors()
         self.num_parts = Model.count_model_parts(self.dir_model, ".safetensors" if self.is_safetensors else ".bin")
         self.part_names = self._get_part_names()
@@ -1041,53 +1044,86 @@ class BitnetModel(Model):
         """Generate LongRoPE2 factors for extended context support.
 
         This generates per-dimension rescale factors based on the LongRoPE2 algorithm.
-        When rope_scaling is configured in the model config with type "longrope2",
-        it generates both long_factors and short_factors tensors.
+        Supports:
+        - Explicit factors from CSV file (--longrope-factors)
+        - Explicit factors from model config (long_factor/short_factor)
+        - Generated factors with --longrope-scale option
         """
-        if rope_scaling := self.find_hparam(["rope_scaling"], optional=True):
+        base = self.hparams.get("rope_theta", 500000.0)
+        dim = self.hparams.get("head_dim", self.hparams["hidden_size"] // self.hparams["num_attention_heads"])
+        half_dim = dim // 2
+        original_context = self.hparams.get("max_position_embeddings", 4096)
+
+        # Priority 1: Use factors from CSV file if provided
+        if self.longrope_factors is not None:
+            import numpy as np
+            logger.info(f"Loading LongRoPE2 factors from {self.longrope_factors}")
+            factors = np.loadtxt(self.longrope_factors, delimiter=",")
+            if len(factors) != half_dim:
+                raise ValueError(f"Factors file has {len(factors)} values, expected {half_dim}")
+            yield ("rope_factors_long.weight", torch.tensor(factors, dtype=torch.float32))
+            yield ("rope_factors_short.weight", torch.tensor([1.0] * half_dim, dtype=torch.float32))
+            return
+
+        # Priority 2: Check for explicit factors in config
+        rope_scaling = self.find_hparam(["rope_scaling"], optional=True)
+        if rope_scaling:
+            long_factors = rope_scaling.get("long_factor", None)
+            short_factors = rope_scaling.get("short_factor", None)
+
+            if long_factors is not None and short_factors is not None:
+                if len(long_factors) != len(short_factors) or len(long_factors) != half_dim:
+                    raise ValueError(f"The length of rope long and short factors must be {half_dim}")
+                yield ("rope_factors_long.weight", torch.tensor(long_factors, dtype=torch.float32))
+                yield ("rope_factors_short.weight", torch.tensor(short_factors, dtype=torch.float32))
+                return
+
             rope_type = rope_scaling.get("rope_type", rope_scaling.get("type", "")).lower()
 
             if rope_type in ("longrope", "longrope2", "su", "yarn"):
-                base = self.hparams.get("rope_theta", 500000.0)
-                dim = self.hparams.get("head_dim", self.hparams["hidden_size"] // self.hparams["num_attention_heads"])
+                factor = rope_scaling.get("factor", 8.0)
+                low_freq_factor = rope_scaling.get("low_freq_factor", 1.0)
+                high_freq_factor = rope_scaling.get("high_freq_factor", 4.0)
+                old_context_len = self.hparams.get("original_max_position_embeddings", original_context)
 
-                long_factors = rope_scaling.get("long_factor", None)
-                short_factors = rope_scaling.get("short_factor", None)
+                freqs = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
+                low_freq_wavelen = old_context_len / low_freq_factor
+                high_freq_wavelen = old_context_len / high_freq_factor
 
-                if long_factors is not None and short_factors is not None:
-                    # Use provided factors from config
-                    if len(long_factors) != len(short_factors) or len(long_factors) != dim // 2:
-                        raise ValueError(f"The length of rope long and short factors must be {dim // 2}")
+                rope_factors = []
+                for freq in freqs:
+                    wavelen = 2 * math.pi / freq
+                    if wavelen < high_freq_wavelen:
+                        rope_factors.append(1.0)
+                    elif wavelen > low_freq_wavelen:
+                        rope_factors.append(factor)
+                    else:
+                        smooth = (old_context_len / wavelen - low_freq_factor) / (high_freq_factor - low_freq_factor)
+                        rope_factors.append(1.0 / ((1.0 - smooth) / factor + smooth))
 
-                    yield ("rope_factors_long.weight", torch.tensor(long_factors, dtype=torch.float32))
-                    yield ("rope_factors_short.weight", torch.tensor(short_factors, dtype=torch.float32))
-                else:
-                    # Generate default LongRoPE2-style factors
-                    factor = rope_scaling.get("factor", 8.0)
-                    low_freq_factor = rope_scaling.get("low_freq_factor", 1.0)
-                    high_freq_factor = rope_scaling.get("high_freq_factor", 4.0)
-                    old_context_len = self.hparams.get("original_max_position_embeddings",
-                                                       self.hparams.get("max_position_embeddings", 4096))
+                yield ("rope_factors_long.weight", torch.tensor(rope_factors, dtype=torch.float32))
+                yield ("rope_factors_short.weight", torch.tensor([1.0] * len(rope_factors), dtype=torch.float32))
+                return
 
-                    freqs = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
+        # Priority 3: Generate NTK-aware factors with --longrope-scale
+        scale = self.longrope_scale
+        if scale != 1.0:
+            logger.info(f"Generating NTK-aware LongRoPE2 factors with scale={scale}")
 
-                    low_freq_wavelen = old_context_len / low_freq_factor
-                    high_freq_wavelen = old_context_len / high_freq_factor
+        # Compute critical dimension (d_tcd) for NTK-aware scaling
+        log_val = math.log(original_context / (2 * math.pi)) / math.log(base)
+        critical_dim = max(0, min(int(2 * math.ceil(half_dim * log_val)), half_dim))
 
-                    rope_factors = []
-                    for freq in freqs:
-                        wavelen = 2 * math.pi / freq
-                        if wavelen < high_freq_wavelen:
-                            rope_factors.append(1.0)
-                        elif wavelen > low_freq_wavelen:
-                            rope_factors.append(factor)
-                        else:
-                            smooth = (old_context_len / wavelen - low_freq_factor) / (high_freq_factor - low_freq_factor)
-                            rope_factors.append(1.0 / ((1.0 - smooth) / factor + smooth))
+        ntk_factors = []
+        for i in range(half_dim):
+            if i >= critical_dim:
+                ntk_factors.append(scale)
+            else:
+                ratio = i / critical_dim if critical_dim > 0 else 0
+                ntk_factors.append(1.0 + (scale - 1.0) * ratio)
 
-                    # For LongRoPE2, long_factors are the computed values, short_factors are all 1.0
-                    yield ("rope_factors_long.weight", torch.tensor(rope_factors, dtype=torch.float32))
-                    yield ("rope_factors_short.weight", torch.tensor([1.0] * len(rope_factors), dtype=torch.float32))
+        yield ("rope_factors_long.weight", torch.tensor(ntk_factors, dtype=torch.float32))
+        yield ("rope_factors_short.weight", torch.tensor([1.0] * half_dim, dtype=torch.float32))
 
     def write_tensors(self):
         max_name_len = max(len(s) for _, s in self.tensor_map.mapping.values()) + len(".weight,")
@@ -1231,6 +1267,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model-name", type=str, default=None, help="name of the model")
     parser.add_argument("--verbose", action="store_true", help="increase output verbosity")
     parser.add_argument("--quant-embd", action="store_true", help="quantize the embedding layer")
+    parser.add_argument("--longrope-scale", type=float, default=1.0,
+                        help="LongRoPE2 scaling factor for extended context (e.g., 2.0 for 8K, 4.0 for 16K)")
+    parser.add_argument("--longrope-factors", type=Path, default=None,
+                        help="Path to CSV file containing pre-computed LongRoPE2 factors")
 
     return parser.parse_args()
 
@@ -1256,7 +1296,10 @@ def main() -> None:
 
     with torch.inference_mode():
         model_class = Model.from_model_architecture(hparams["architectures"][0])
-        model_instance = model_class(dir_model, ftype_map[args.outtype], fname_out, args.bigendian, args.use_temp_file)
+        model_instance = model_class(
+            dir_model, ftype_map[args.outtype], fname_out, args.bigendian, args.use_temp_file,
+            longrope_scale=args.longrope_scale, longrope_factors=args.longrope_factors
+        )
 
         logger.info("Set model parameters")
         model_instance.set_gguf_parameters()
