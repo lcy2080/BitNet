@@ -1059,10 +1059,8 @@ class BitnetModel(Model):
                     if len(long_factors) != len(short_factors) or len(long_factors) != dim // 2:
                         raise ValueError(f"The length of rope long and short factors must be {dim // 2}")
 
-                    yield (self.format_tensor_name(gguf.MODEL_TENSOR.ROPE_FACTORS_LONG),
-                           torch.tensor(long_factors, dtype=torch.float32))
-                    yield (self.format_tensor_name(gguf.MODEL_TENSOR.ROPE_FACTORS_SHORT),
-                           torch.tensor(short_factors, dtype=torch.float32))
+                    yield ("rope_factors_long.weight", torch.tensor(long_factors, dtype=torch.float32))
+                    yield ("rope_factors_short.weight", torch.tensor(short_factors, dtype=torch.float32))
                 else:
                     # Generate default LongRoPE2-style factors
                     factor = rope_scaling.get("factor", 8.0)
@@ -1088,10 +1086,8 @@ class BitnetModel(Model):
                             rope_factors.append(1.0 / ((1.0 - smooth) / factor + smooth))
 
                     # For LongRoPE2, long_factors are the computed values, short_factors are all 1.0
-                    yield (self.format_tensor_name(gguf.MODEL_TENSOR.ROPE_FACTORS_LONG),
-                           torch.tensor(rope_factors, dtype=torch.float32))
-                    yield (self.format_tensor_name(gguf.MODEL_TENSOR.ROPE_FACTORS_SHORT),
-                           torch.tensor([1.0] * len(rope_factors), dtype=torch.float32))
+                    yield ("rope_factors_long.weight", torch.tensor(rope_factors, dtype=torch.float32))
+                    yield ("rope_factors_short.weight", torch.tensor([1.0] * len(rope_factors), dtype=torch.float32))
 
     def write_tensors(self):
         max_name_len = max(len(s) for _, s in self.tensor_map.mapping.values()) + len(".weight,")
@@ -1189,6 +1185,12 @@ class BitnetModel(Model):
                 self.gguf_writer.add_tensor(new_name, data, raw_shape=shape, raw_dtype=data_qtype)
                 if i2_scale is not None:
                     self.gguf_writer.add_tensor(new_name + "_scale", i2_scale, raw_dtype=gguf.GGMLQuantizationType.F32)
+
+        # Write extra tensors (LongRoPE2 factors)
+        for new_name, data_torch in self.generate_extra_tensors():
+            data = data_torch.squeeze().numpy()
+            logger.info(f"{new_name}, generated --> F32, shape = {{{', '.join(str(n) for n in reversed(data.shape))}}}")
+            self.gguf_writer.add_tensor(new_name, data, raw_dtype=gguf.GGMLQuantizationType.F32)
 
 
 ###### CONVERSION LOGIC ######
