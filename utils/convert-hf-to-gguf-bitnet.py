@@ -6,6 +6,7 @@ import logging
 import argparse
 import contextlib
 import json
+import math
 import os
 import re
 import sys
@@ -13,7 +14,7 @@ from abc import ABC, abstractmethod
 from enum import IntEnum
 from pathlib import Path
 from hashlib import sha256
-from typing import TYPE_CHECKING, Any, Callable, ContextManager, Iterator, Sequence, TypeVar, cast
+from typing import TYPE_CHECKING, Any, Callable, ContextManager, Iterable, Iterator, Sequence, TypeVar, cast
 import configparser
 
 import numpy as np
@@ -1035,6 +1036,62 @@ class BitnetModel(Model):
                 data_torch = F.pad(data_torch, (0, 0, 0, pad_size), mode='constant', value=0)
 
         return [(self.map_tensor_name(name), data_torch)]
+
+    def generate_extra_tensors(self) -> Iterable[tuple[str, torch.Tensor]]:
+        """Generate LongRoPE2 factors for extended context support.
+
+        This generates per-dimension rescale factors based on the LongRoPE2 algorithm.
+        When rope_scaling is configured in the model config with type "longrope2",
+        it generates both long_factors and short_factors tensors.
+        """
+        if rope_scaling := self.find_hparam(["rope_scaling"], optional=True):
+            rope_type = rope_scaling.get("rope_type", rope_scaling.get("type", "")).lower()
+
+            if rope_type in ("longrope", "longrope2", "su", "yarn"):
+                base = self.hparams.get("rope_theta", 500000.0)
+                dim = self.hparams.get("head_dim", self.hparams["hidden_size"] // self.hparams["num_attention_heads"])
+
+                long_factors = rope_scaling.get("long_factor", None)
+                short_factors = rope_scaling.get("short_factor", None)
+
+                if long_factors is not None and short_factors is not None:
+                    # Use provided factors from config
+                    if len(long_factors) != len(short_factors) or len(long_factors) != dim // 2:
+                        raise ValueError(f"The length of rope long and short factors must be {dim // 2}")
+
+                    yield (self.format_tensor_name(gguf.MODEL_TENSOR.ROPE_FACTORS_LONG),
+                           torch.tensor(long_factors, dtype=torch.float32))
+                    yield (self.format_tensor_name(gguf.MODEL_TENSOR.ROPE_FACTORS_SHORT),
+                           torch.tensor(short_factors, dtype=torch.float32))
+                else:
+                    # Generate default LongRoPE2-style factors
+                    factor = rope_scaling.get("factor", 8.0)
+                    low_freq_factor = rope_scaling.get("low_freq_factor", 1.0)
+                    high_freq_factor = rope_scaling.get("high_freq_factor", 4.0)
+                    old_context_len = self.hparams.get("original_max_position_embeddings",
+                                                       self.hparams.get("max_position_embeddings", 4096))
+
+                    freqs = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
+
+                    low_freq_wavelen = old_context_len / low_freq_factor
+                    high_freq_wavelen = old_context_len / high_freq_factor
+
+                    rope_factors = []
+                    for freq in freqs:
+                        wavelen = 2 * math.pi / freq
+                        if wavelen < high_freq_wavelen:
+                            rope_factors.append(1.0)
+                        elif wavelen > low_freq_wavelen:
+                            rope_factors.append(factor)
+                        else:
+                            smooth = (old_context_len / wavelen - low_freq_factor) / (high_freq_factor - low_freq_factor)
+                            rope_factors.append(1.0 / ((1.0 - smooth) / factor + smooth))
+
+                    # For LongRoPE2, long_factors are the computed values, short_factors are all 1.0
+                    yield (self.format_tensor_name(gguf.MODEL_TENSOR.ROPE_FACTORS_LONG),
+                           torch.tensor(rope_factors, dtype=torch.float32))
+                    yield (self.format_tensor_name(gguf.MODEL_TENSOR.ROPE_FACTORS_SHORT),
+                           torch.tensor([1.0] * len(rope_factors), dtype=torch.float32))
 
     def write_tensors(self):
         max_name_len = max(len(s) for _, s in self.tensor_map.mapping.values()) + len(".weight,")
