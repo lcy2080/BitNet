@@ -952,12 +952,13 @@ class LlamaModel(Model):
                 raise ValueError(f"Unprocessed experts: {experts}")
 
 
-@Model.register("BitnetForCausalLM")
+@Model.register("BitnetForCausalLM", "BitNetForCausalLM")
 class BitnetModel(Model):
     model_arch = gguf.MODEL_ARCH.BITNET
 
     def set_vocab(self):
-        self._set_vocab_sentencepiece()
+        # BitNet b1.58-2B-4T uses GPT-2 tokenizer
+        self._set_vocab_gpt2()
         
     def set_gguf_parameters(self):
         super().set_gguf_parameters()
@@ -966,6 +967,16 @@ class BitnetModel(Model):
 
         self.gguf_writer.add_rope_scaling_type(gguf.RopeScalingType.LINEAR)
         self.gguf_writer.add_rope_scaling_factor(1.0)
+
+        # BitNet b1.58-2B-4T uses special attention dimensions
+        # K,V head dim is 32 (not 128 = hidden_size / n_heads)
+        # Q head dim is 128 but matches KV head count (5 heads)
+        n_head_kv = self.hparams.get("num_key_value_heads", 5)
+        # K,V dims: [n_head_kv * kv_head_dim, hidden_size] = [160, 2560] -> kv_head_dim = 32
+        # Q dims: [n_head_kv * q_head_dim, hidden_size] = [640, 2560] -> q_head_dim = 128
+        kv_head_dim = 32  # K,V head dimension
+        self.gguf_writer.add_key_length(kv_head_dim)
+        self.gguf_writer.add_value_length(kv_head_dim)
 
     def weight_quant(self, weight):
         dtype = weight.dtype
@@ -988,7 +999,7 @@ class BitnetModel(Model):
 
         for name, data_torch in self.get_tensors():
             # we don't need these
-            if name.endswith((".attention.masked_bias", ".attention.bias", ".rotary_emb.inv_freq")):
+            if name.endswith((".attention.masked_bias", ".attention.bias", ".rotary_emb.inv_freq", ".weight_scale")):
                 continue
 
             old_dtype = data_torch.dtype
